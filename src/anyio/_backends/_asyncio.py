@@ -31,7 +31,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -90,6 +90,13 @@ from .._core._synchronization import (
     SemaphoreStatistics,
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
+from .._core import _taskgroup_policy as tgpolicy
+from .._core._taskgroup_policy import (
+    GroupExitSurface,
+    SpawnScopeBind,
+    StartReparentGate,
+    TaskGroupPolicyView,
+)
 from .._core._tasks import CancelScope as BaseCancelScope
 from .._core._tasks import TaskHandle
 from ..abc import (
@@ -747,7 +754,7 @@ _task_states: WeakKeyDictionary[asyncio.Task, TaskState] = WeakKeyDictionary()
 class _AsyncioTaskStatus(abc.TaskStatus[T_contra]):
     def __init__(
         self,
-        future: asyncio.Future,
+        future: asyncio.Future | None,
         parent_id: int,
         target_scope: CancelScope,
         spawn_scope: CancelScope,
@@ -759,18 +766,40 @@ class _AsyncioTaskStatus(abc.TaskStatus[T_contra]):
         self._target_scope = target_scope
         # The task's own cancel scope, also held by its TaskHandle
         self._spawn_scope = spawn_scope
+        # Used when there is no start() future (deferred start_soon membership)
+        self._started_called = False
 
     def started(self, value: T_contra | None = None) -> None:
         task = cast(asyncio.Task, current_task())
-        _task_states[task].parent_id = self._parent_id
-        if self._future.done():
-            if not self._future.cancelled():
-                raise RuntimeError("called 'started' twice on the same task status")
-            else:
-                # Caller of start() was cancelled, nothing to reparent
-                return
+        if self._future is not None:
+            if self._future.done():
+                if not self._future.cancelled():
+                    raise RuntimeError(
+                        "called 'started' twice on the same task status"
+                    )
+                else:
+                    # Caller of start() was cancelled, nothing to reparent
+                    return
+        elif self._started_called:
+            raise RuntimeError("called 'started' twice on the same task status")
 
-        self._future.set_result(value)
+        # Read the reparent gate live at the readiness signal, from the child
+        # task's own policy stack.
+        gate = tgpolicy.get_current_task_group_policy().start_reparent_gate
+        if (
+            gate is StartReparentGate.REJECT_STARTED_AFTER_GROUP_CANCEL
+            and self._target_scope._cancel_called
+        ):
+            raise RuntimeError(
+                "task_status.started() was called after the target task group "
+                "had been cancelled"
+            )
+
+        self._started_called = True
+        _task_states[task].parent_id = self._parent_id
+        if self._future is not None:
+            self._future.set_result(value)
+
         self._spawn_scope._reparent(self._target_scope)
 
 
@@ -784,18 +813,36 @@ class TaskGroup(abc.TaskGroup):
     def __init__(self) -> None:
         self.cancel_scope: CancelScope = CancelScope()
         self._entered = False
+        self._exiting = False
         self._exceptions: list[BaseException] = []
         self._tasks: set[asyncio.Task] = set()
+        self._handles: dict[asyncio.Task, TaskHandle[Any]] = {}
         self._on_completed_fut: asyncio.Future[None] | None = None
 
     async def __aenter__(self) -> Self:
         if self._entered:
             raise RuntimeError("TaskGroup cannot be entered more than once")
 
+        # Bind the spawn tree runtime before any child is spawned so that the
+        # child tasks inherit the same runtime object.
+        tgpolicy._bind_tree_runtime()
         self._entered = True
 
         self.cancel_scope.__enter__()
         return self
+
+    def current_policy_view(self) -> TaskGroupPolicyView:
+        """
+        Return the active policy frame merged with this group's current state
+        (its cancel scope, number of pending children, entered/exiting flags).
+        """
+        return TaskGroupPolicyView(
+            frame=tgpolicy.get_current_task_group_policy(),
+            cancel_scope=self.cancel_scope,
+            pending_tasks=len(self._tasks),
+            entered=self._entered,
+            exiting=self._exiting,
+        )
 
     async def __aexit__(
         self,
@@ -803,6 +850,12 @@ class TaskGroup(abc.TaskGroup):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
+        # The exit surface is resolved here, at __aexit__ entry. Pushing while
+        # this wait loop is running is rejected by push_task_group_policy().
+        frame = tgpolicy.get_current_task_group_policy()
+        surface = frame.group_exit_surface
+        self._exiting = True
+        exit_host_id = tgpolicy._begin_group_exit()
         try:
             if exc_val is not None:
                 self.cancel_scope.cancel()
@@ -813,14 +866,36 @@ class TaskGroup(abc.TaskGroup):
             try:
                 if self._tasks:
                     with CancelScope() as wait_scope:
+                        peers_cancelled = False
                         while self._tasks:
+                            # Read the exit surface of the entry frame on every
+                            # iteration; only CANCEL_PEERS_THEN_WAIT adds the
+                            # direct peer cancellation step.
+                            if (
+                                surface
+                                is GroupExitSurface.CANCEL_PEERS_THEN_WAIT
+                                and not peers_cancelled
+                                and (
+                                    self._exceptions
+                                    or (
+                                        exc_val is not None
+                                        and not isinstance(exc_val, CancelledError)
+                                    )
+                                )
+                            ):
+                                peers_cancelled = True
+                                self._cancel_peer_handles()
+
                             self._on_completed_fut = loop.create_future()
 
                             try:
                                 await self._on_completed_fut
                             except CancelledError as exc:
                                 # Shield the scope against further cancellation attempts,
-                                # as they're not productive (#695)
+                                # as they're not productive (#695). This is the
+                                # transient "shield the wait + cancel the group" path
+                                # required by SHIELDED_WAIT_ON_OUTER_CANCEL; the group's
+                                # own shield flag is never changed.
                                 wait_scope.shield = True
                                 self.cancel_scope.cancel()
 
@@ -857,16 +932,20 @@ class TaskGroup(abc.TaskGroup):
 
             return self.cancel_scope.__exit__(exc_type, exc_val, exc_tb)
         finally:
+            tgpolicy._end_group_exit(exit_host_id)
+            self._exiting = False
             del exc_val, exc_tb, self._exceptions
 
-    def _spawn(
-        self,
-        coro: Coroutine[Any, Any, T_co],
-        name: object,
-        task_status: _AsyncioTaskStatus | None = None,
-    ) -> TaskHandle[T_co]:
-        task_status_future = task_status._future if task_status is not None else None
+    def _cancel_peer_handles(self) -> None:
+        """Directly cancel every child task still running (self-shield bypass)."""
+        for task in tuple(self._tasks):
+            handle = self._handles.get(task)
+            if handle is not None and not task.done():
+                handle.cancel()
 
+    def _make_task_done_callback(
+        self, task_status_future: asyncio.Future | None
+    ) -> Callable[[asyncio.Task[Any]], None]:
         def task_done(_task: asyncio.Task) -> None:
             if sys.version_info >= (3, 14) and self.cancel_scope._host_task is not None:
                 asyncio.future_discard_from_awaited_by(
@@ -874,11 +953,13 @@ class TaskGroup(abc.TaskGroup):
                 )
 
             task_state = _task_states[_task]
-            assert task_state.cancel_scope is not None
-            assert _task in task_state.cancel_scope._tasks
-            task_state.cancel_scope._tasks.remove(_task)
-            self._tasks.remove(task)
+            if task_state.cancel_scope is not None:
+                assert _task in task_state.cancel_scope._tasks
+                task_state.cancel_scope._tasks.remove(_task)
+
+            self._tasks.remove(_task)
             del _task_states[_task]
+            self._handles.pop(_task, None)
 
             if self._on_completed_fut is not None and not self._tasks:
                 try:
@@ -914,29 +995,63 @@ class TaskGroup(abc.TaskGroup):
                     RuntimeError("Child exited without calling task_status.started()")
                 )
 
-        if task_status_future is not None:
-            parent_id = id(current_task())
-            caller_state = _task_states.get(cast(asyncio.Task, current_task()))
-            if caller_state is not None and caller_state.cancel_scope is not None:
-                initial_scope = caller_state.cancel_scope
-            else:
-                # The caller is an unmanaged task (no task state)
-                initial_scope = self.cancel_scope
-        else:
-            parent_id = id(self.cancel_scope._host_task)
-            initial_scope = self.cancel_scope
+        return task_done
 
-        spawn_scope = task_status._spawn_scope if task_status is not None else None
-        handle = TaskHandle(coro, name, cancel_scope=spawn_scope)
+    def _resolve_deferred_scope(self) -> tuple[CancelScope | None, int]:
+        """
+        Resolve the scope a not-yet-started child is pinned to under the
+        keep-caller-until-started binding.
+
+        When the caller itself hosts the group, the child's scope is made a
+        sibling of the group scope (attached to the group scope's parent) so
+        that cancelling the group cannot reach the unreported child, while
+        outer cancellation still does. Otherwise the caller's current scope is
+        used, mirroring the historical ``start()`` pinning.
+        """
+        caller_task = cast(asyncio.Task, current_task())
+        parent_id = id(caller_task)
+        if caller_task is self.cancel_scope._host_task:
+            return self.cancel_scope._parent_scope, parent_id
+
+        caller_state = _task_states.get(caller_task)
+        if caller_state is not None and caller_state.cancel_scope is not None:
+            return caller_state.cancel_scope, parent_id
+
+        return self.cancel_scope, parent_id
+
+    def _schedule_child_task(
+        self,
+        handle: TaskHandle[T_co],
+        parent_id: int,
+        initial_scope: CancelScope | None,
+        eager_allowed: bool,
+        task_status: _AsyncioTaskStatus[Any] | None,
+    ) -> TaskHandle[T_co]:
+        """
+        Create and register the asyncio task for a child. This is a low level
+        primitive; policy decisions (scope binding, reparent gates) are made by
+        its callers, never here.
+        """
+        task_status_future = task_status._future if task_status is not None else None
         loop = asyncio.get_running_loop()
         wrapper_coro = handle._run_coro()
+        factory = loop.get_task_factory()
+        eager_factory_active = (
+            factory is not None
+            and getattr(factory, "__code__", None) is _eager_task_factory_code
+            and getattr(factory, "__closure__", None) is not None
+        )
         try:
-            if (
-                (factory := loop.get_task_factory())
-                and getattr(factory, "__code__", None) is _eager_task_factory_code
-                and (closure := getattr(factory, "__closure__", None))
-            ):
-                custom_task_constructor = closure[0].cell_contents
+            if eager_allowed and eager_factory_active:
+                # Honor the configured eager factory: the child may run up to
+                # its first suspension point synchronously here.
+                assert factory is not None
+                task = factory(loop, wrapper_coro, name=handle.name)
+            elif eager_factory_active:
+                # Baseline behavior: construct the task without the eager first
+                # step, even though the loop factory is an eager factory.
+                assert factory is not None
+                custom_task_constructor = factory.__closure__[0].cell_contents  # type: ignore[index]
                 task = custom_task_constructor(
                     wrapper_coro, loop=loop, name=handle.name
                 )
@@ -947,18 +1062,43 @@ class TaskGroup(abc.TaskGroup):
                 wrapper_coro.close()
 
             with suppress(BaseException):
-                coro.close()
+                handle._coro.close()
 
             raise
 
-        # Make the spawned task inherit the initial cancel scope
-        _task_states[task] = TaskState(parent_id=parent_id, cancel_scope=initial_scope)
-        initial_scope._tasks.add(task)
+        existing_state = _task_states.get(task)
+        if existing_state is None:
+            _task_states[task] = TaskState(
+                parent_id=parent_id, cancel_scope=initial_scope
+            )
+            if initial_scope is not None:
+                initial_scope._tasks.add(task)
+        else:
+            # The task already ran a segment under the eager factory before we
+            # could register it. Reconcile the state created by the child's
+            # cancel scope __enter__ instead of overwriting it.
+            if existing_state.parent_id is None:
+                existing_state.parent_id = parent_id
+
+            spawn_scope = handle._cancel_scope
+            if (
+                initial_scope is not None
+                and spawn_scope._active
+                and spawn_scope._parent_scope is None
+            ):
+                # Link the chain the child already entered below the scope it
+                # was supposed to start in. started() during the eager segment
+                # may already have reparented the spawn scope itself.
+                spawn_scope._parent_scope = initial_scope
+                initial_scope._child_scopes.add(spawn_scope)
+                spawn_scope._restart_cancellation_in_parent()
+
         self._tasks.add(task)
+        self._handles[task] = cast(TaskHandle[Any], handle)
         if sys.version_info >= (3, 14) and self.cancel_scope._host_task is not None:
             asyncio.future_add_to_awaited_by(task, self.cancel_scope._host_task)
 
-        task.add_done_callback(task_done)
+        task.add_done_callback(self._make_task_done_callback(task_status_future))
         return handle
 
     def create_task(
@@ -980,9 +1120,42 @@ class TaskGroup(abc.TaskGroup):
         final_name = get_coro_name(coro, name)
 
         if context is not None:
-            return context.run(self._spawn, coro, name=final_name)
+            return context.run(self._spawn_soon_child, coro, final_name)
         else:
-            return self._spawn(coro, name=final_name)
+            return self._spawn_soon_child(coro, final_name)
+
+    def _spawn_soon_child(
+        self, coro: Coroutine[Any, Any, T_co], name: object
+    ) -> TaskHandle[T_co]:
+        # The start_soon / create_task spawn path reads spawn_scope_bind here.
+        frame = tgpolicy.get_current_task_group_policy()
+        eager_allowed = (
+            frame.start_reparent_gate is StartReparentGate.EAGER_SAFE_REPARENT
+        )
+        if frame.spawn_scope_bind is SpawnScopeBind.KEEP_CALLER_UNTIL_STARTED:
+            # Defer group scope membership until the child reports readiness
+            # through its spawn status.
+            initial_scope, parent_id = self._resolve_deferred_scope()
+            spawn_scope = CancelScope()
+            task_status: _AsyncioTaskStatus[Any] | None = _AsyncioTaskStatus(
+                None, id(self.cancel_scope._host_task), self.cancel_scope, spawn_scope
+            )
+            handle = TaskHandle(coro, name, cancel_scope=spawn_scope)
+            with tgpolicy._install_spawn_status(task_status):
+                return self._schedule_child_task(
+                    handle, parent_id, initial_scope, eager_allowed, task_status
+                )
+
+        # PIN_DEFAULT and FORCE_GROUP_IMMEDIATE: start_soon children belong to
+        # the group scope immediately.
+        handle = TaskHandle(coro, name)
+        return self._schedule_child_task(
+            handle,
+            id(self.cancel_scope._host_task),
+            self.cancel_scope,
+            eager_allowed,
+            None,
+        )
 
     async def start(
         self,
@@ -996,21 +1169,51 @@ class TaskGroup(abc.TaskGroup):
                 "This task group is not active; no new tasks can be started."
             )
 
-        # Until task_status.started() is called, a task spawned via start() belongs to
-        # the *caller's* cancel scope, not the target group's, so cancelling the group
-        # does not cancel a task that hasn't reported startup yet. The
-        # task_status.started() call moves the task's cancel scope to this task group's
-        # cancel scope.
-        #
-        # The caller may be an unmanaged task (no _task_states entry), in which case
-        # fall back to the group's own scope.
+        # The start() spawn path is intentionally separate from
+        # _spawn_soon_child(): it reads both spawn_scope_bind (pre-started
+        # binding) and start_reparent_gate (enforced in task_status.started()),
+        # and owns the readiness future.
+        frame = tgpolicy.get_current_task_group_policy()
+        eager_allowed = (
+            frame.start_reparent_gate is StartReparentGate.EAGER_SAFE_REPARENT
+        )
         future: asyncio.Future = asyncio.Future()
         final_name = get_callable_name(func, name)
+        spawn_scope = CancelScope()
         task_status: _AsyncioTaskStatus[Any] = _AsyncioTaskStatus(
-            future, id(self.cancel_scope._host_task), self.cancel_scope, CancelScope()
+            future, id(self.cancel_scope._host_task), self.cancel_scope, spawn_scope
         )
+
+        if frame.spawn_scope_bind is SpawnScopeBind.FORCE_GROUP_IMMEDIATE:
+            # The child belongs to the group scope from the outset, even
+            # before reporting readiness.
+            parent_id = id(self.cancel_scope._host_task)
+            initial_scope: CancelScope | None = self.cancel_scope
+        elif frame.spawn_scope_bind is SpawnScopeBind.KEEP_CALLER_UNTIL_STARTED:
+            initial_scope, parent_id = self._resolve_deferred_scope()
+        else:
+            # PIN_DEFAULT: until task_status.started() is called, the child
+            # belongs to the caller's current cancel scope, not the target
+            # group's. An unmanaged caller falls back to the group's own scope.
+            caller_task = cast(asyncio.Task, current_task())
+            parent_id = id(caller_task)
+            caller_state = _task_states.get(caller_task)
+            if caller_state is not None and caller_state.cancel_scope is not None:
+                initial_scope = caller_state.cancel_scope
+            else:
+                initial_scope = self.cancel_scope
+
         coro = call_for_coroutine(func, args, task_status=task_status)
-        handle = self._spawn(coro, final_name, task_status)
+        handle = TaskHandle(coro, final_name, cancel_scope=spawn_scope)
+        if frame.spawn_scope_bind is SpawnScopeBind.PIN_DEFAULT:
+            install_context = nullcontext(None)
+        else:
+            install_context = tgpolicy._install_spawn_status(task_status)
+
+        with install_context:
+            self._schedule_child_task(
+                handle, parent_id, initial_scope, eager_allowed, task_status
+            )
 
         # If the task raises an exception after sending a start value without a switch
         # point between, the task group is cancelled and this method never proceeds to

@@ -18,6 +18,7 @@ else:
     from typing_extensions import TypeVarTuple, Unpack
 
 if TYPE_CHECKING:
+    from .._core._taskgroup_policy import TaskGroupPolicyView
     from .._core._tasks import CancelScope, TaskHandle
 
 T_co = TypeVar("T_co", covariant=True)
@@ -114,6 +115,19 @@ class TaskGroup(metaclass=ABCMeta):
 
         """
         self.cancel_scope.cancel(reason)
+
+    def current_policy_view(self) -> TaskGroupPolicyView:
+        """
+        Return the active task group policy frame merged with this group's
+        runtime state (its cancel scope, number of pending children, and its
+        entered/exiting flags).
+
+        Backends provide the concrete implementation.
+
+        .. versionadded:: 4.16.0
+
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def create_task(

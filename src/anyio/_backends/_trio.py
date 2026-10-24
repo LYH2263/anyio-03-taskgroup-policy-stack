@@ -5,6 +5,7 @@ import math
 import os
 import socket
 import sys
+import trio
 import types
 import weakref
 from collections.abc import (
@@ -17,8 +18,8 @@ from collections.abc import (
     Iterable,
     Sequence,
 )
-from contextlib import AbstractContextManager
-from contextvars import Context
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
+from contextvars import Context, copy_context
 from dataclasses import dataclass
 from functools import partial, wraps
 from io import IOBase
@@ -80,6 +81,13 @@ from .._core._synchronization import (
     SemaphoreStatistics,
 )
 from .._core._synchronization import Semaphore as BaseSemaphore
+from .._core import _taskgroup_policy as tgpolicy
+from .._core._taskgroup_policy import (
+    GroupExitSurface,
+    SpawnScopeBind,
+    StartReparentGate,
+    TaskGroupPolicyView,
+)
 from .._core._tasks import CancelScope as BaseCancelScope
 from .._core._tasks import TaskHandle
 from ..abc import IPSockAddrType, UDPPacketType, UNIXDatagramPacketType
@@ -202,11 +210,33 @@ class CancelScope(BaseCancelScope):
 empty_start_value = sentinel("empty_start_value")
 
 
+def _check_start_reparent_gate(nursery: trio.Nursery) -> None:
+    """Enforce the active start_reparent_gate policy at a started() call."""
+    gate = tgpolicy.get_current_task_group_policy().start_reparent_gate
+    if (
+        gate is StartReparentGate.REJECT_STARTED_AFTER_GROUP_CANCEL
+        and nursery.cancel_scope.cancel_called
+    ):
+        raise RuntimeError(
+            "task_status.started() was called after the target task group had "
+            "been cancelled"
+        )
+
+
 class _TrioTaskStatus(abc.TaskStatus[T_contra], Generic[T_contra]):
-    early_start_value: T_contra | object = empty_start_value
-    real_task_status: trio.TaskStatus[T_contra | None] | None = None
+    """
+    Task status used by the deferred ``start()`` paths.  Trio's own
+    ``nursery.start()`` machinery performs the actual reparent when
+    ``real_task_status.started()`` is called.
+    """
+
+    def __init__(self, nursery: trio.Nursery) -> None:
+        self._nursery = nursery
+        self.early_start_value: T_contra | object = empty_start_value
+        self.real_task_status: trio.TaskStatus[T_contra | None] | None = None
 
     def started(self, value: T_contra | None = None) -> None:
+        _check_start_reparent_gate(self._nursery)
         if self.real_task_status is None:
             if self.early_start_value is not empty_start_value:
                 raise RuntimeError("called 'started' twice on the same task status")
@@ -216,12 +246,87 @@ class _TrioTaskStatus(abc.TaskStatus[T_contra], Generic[T_contra]):
             self.real_task_status.started(value)
 
 
+class _ForceGroupTaskStatus(abc.TaskStatus[Any]):
+    """
+    Task status for the FORCE_GROUP_IMMEDIATE ``start()`` path.  The child is
+    spawned directly into the group nursery; this status only conveys the
+    readiness signal to the caller of ``start()``.
+    """
+
+    def __init__(
+        self, nursery: trio.Nursery, settled: trio.Event, result_box: dict[str, Any]
+    ) -> None:
+        self._nursery = nursery
+        self._settled = settled
+        self._result_box = result_box
+        self._started = False
+
+    def started(self, value: Any = None) -> None:
+        _check_start_reparent_gate(self._nursery)
+        if self._started:
+            raise RuntimeError("called 'started' twice on the same task status")
+
+        self._started = True
+        self._result_box["result"] = Value(value)
+        self._settled.set()
+
+
+class _DeferredTaskStatus(abc.TaskStatus[Any]):
+    """
+    Task status for children whose group membership is deferred under a
+    KEEP_CALLER_UNTIL_STARTED frame.  Trio's own task status moves the child
+    task into the group nursery when ``started()`` is called.
+    """
+
+    def __init__(self, nursery: trio.Nursery) -> None:
+        self._nursery = nursery
+        self._real_task_status: trio.TaskStatus[Any] | None = None
+        self._started = False
+
+    def started(self, value: Any = None) -> None:
+        _check_start_reparent_gate(self._nursery)
+        if self._started:
+            raise RuntimeError("called 'started' twice on the same task status")
+
+        self._started = True
+        if self._real_task_status is not None:
+            self._real_task_status.started(value)
+
+
+class _DeferredSpawnRequest:
+    """A deferred start_soon request handed to the holding nursery broker."""
+
+    __slots__ = ("ctx", "handle")
+
+    def __init__(self, ctx: Context, handle: TaskHandle[Any]) -> None:
+        self.ctx = ctx
+        self.handle = handle
+
+
 class TaskGroup(abc.TaskGroup):
     def __init__(self) -> None:
         self._entered = False
         self._active = False
-        self._nursery_manager = trio.open_nursery(strict_exception_groups=True)
+        self._exiting = False
+        #: Nursery that hosts the broker and children whose group membership
+        #: is deferred.  It is opened in the host task just before the group
+        #: nursery, so its cancel scope is an ancestor of the group scope:
+        #: group cancellation never reaches it, while cancellation of any
+        #: scope enclosing the host does.
+        self._holding_manager = trio.open_nursery()
+        self._holding: trio.Nursery | None = None
+        self._nursery_manager: AbstractAsyncContextManager[Any] | None = None
+        self._nursery: trio.Nursery | None = None
         self.cancel_scope = None  # type: ignore[assignment]
+        #: Live child handles (weakly held; tasks themselves keep them alive).
+        self._handles: weakref.WeakSet[TaskHandle[Any]] = weakref.WeakSet()
+        #: Errors from children that failed before joining the group nursery.
+        self._external_exceptions: list[BaseException] = []
+        #: Children not yet attached to the group nursery.
+        self._deferred_pending = 0
+        self._deferred_drained: trio.Event | None = None
+        self._broker_handle: TaskHandle[Any] | None = None
+        self._broker_tx: Any = None
 
     async def __aenter__(self) -> Self:
         if self._entered:
@@ -229,9 +334,32 @@ class TaskGroup(abc.TaskGroup):
 
         self._entered = True
         self._active = True
+
+        # Bind the spawn tree runtime before any child is spawned.
+        tgpolicy._bind_tree_runtime()
+        assert self._holding is None
+        self._holding = await self._holding_manager.__aenter__()
+        self._nursery_manager = trio.open_nursery(strict_exception_groups=True)
         self._nursery = await self._nursery_manager.__aenter__()
+        self._deferred_drained = trio.Event()
+        self._deferred_drained.set()
         self.cancel_scope = CancelScope(self._nursery.cancel_scope)
         return self
+
+    def current_policy_view(self) -> TaskGroupPolicyView:
+        """
+        Return the active policy frame merged with this group's current state
+        (its cancel scope, number of pending children, entered/exiting flags).
+        """
+        assert self._nursery is not None
+        pending_tasks = len(self._nursery.child_tasks) + self._deferred_pending
+        return TaskGroupPolicyView(
+            frame=tgpolicy.get_current_task_group_policy(),
+            cancel_scope=self.cancel_scope,
+            pending_tasks=pending_tasks,
+            entered=self._entered,
+            exiting=self._exiting,
+        )
 
     async def __aexit__(
         self,
@@ -239,17 +367,79 @@ class TaskGroup(abc.TaskGroup):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool:
-        try:
-            # trio.Nursery.__exit__ returns bool; .open_nursery has wrong type
-            return await self._nursery_manager.__aexit__(exc_type, exc_val, exc_tb)  # type: ignore[return-value]
-        except BaseExceptionGroup as exc:
-            if not exc.split(trio.Cancelled)[1]:
-                raise trio.Cancelled._create() from exc
+        # The exit surface is resolved here, at __aexit__ entry. Pushing while
+        # this exit is running is rejected by push_task_group_policy().
+        frame = tgpolicy.get_current_task_group_policy()
+        surface = frame.group_exit_surface
+        self._exiting = True
+        exit_host_id = tgpolicy._begin_group_exit()
 
-            raise
+        if surface is GroupExitSurface.CANCEL_PEERS_THEN_WAIT:
+            self._cancel_peer_handles(exc_val)
+
+        try:
+            if self._deferred_pending:
+                # Children that have not reported readiness live in the
+                # holding nursery, so the group nursery cannot wait for them.
+                # Drain them under a transient shield: group cancellation must
+                # not abort this wait (it could never reach those children
+                # anyway), while cancellation of an enclosing scope still
+                # tears the holding nursery down and ends the drain.
+                assert self._deferred_drained is not None
+                with trio.CancelScope(shield=True):
+                    await self._deferred_drained.wait()
+
+            # A trio nursery only cancels its children when its block raises.
+            # An anyio task group always cancels its remaining children on
+            # exit, including the clean-exit path.
+            if exc_val is None:
+                self._nursery.cancel_scope.cancel()
+
+            try:
+                # trio.Nursery.__exit__ returns bool; .open_nursery has wrong type
+                result = await self._nursery_manager.__aexit__(  # type: ignore[return-value]
+                    exc_type, exc_val, exc_tb
+                )
+            except BaseExceptionGroup as exc:
+                exc = self._merge_external_exceptions(exc)
+                if not exc.split(trio.Cancelled)[1]:
+                    raise trio.Cancelled._create() from exc
+
+                raise
+            else:
+                external = self._take_external_exceptions()
+                if external:
+                    if len(external) == 1:
+                        raise external[0]
+
+                    raise BaseExceptionGroup(
+                        "unhandled errors in a TaskGroup", external
+                    )
+
+                return cast(bool, result)
         finally:
+            # The holding nursery is an implementation detail and is always
+            # clean itself (errors from pre-join children were merged into the
+            # group's exceptions above).  Close it without forwarding the
+            # group's exception so that it cannot be wrapped into another
+            # exception group.  Cancellation of an enclosing scope still
+            # surfaces here naturally when its scope closes.
+            await self._exit_holding()
+            tgpolicy._end_group_exit(exit_host_id)
+            self._exiting = False
             del exc_val, exc_tb
             self._active = False
+
+    async def _exit_holding(self) -> None:
+        """
+        Stop accepting deferred spawns and close the holding nursery, which is
+        expected to be clean when this is called.
+        """
+        if self._broker_tx is not None:
+            self._broker_tx.close()
+
+        # trio.Nursery.__exit__ returns bool; .open_nursery has wrong type
+        await self._holding_manager.__aexit__(None, None, None)
 
     def _check_active(self, coro: Coroutine | None = None) -> None:
         if not self._active:
@@ -259,6 +449,43 @@ class TaskGroup(abc.TaskGroup):
             raise RuntimeError(
                 "This task group is not active; no new tasks can be started."
             )
+
+    def _cancel_peer_handles(self, exc_val: BaseException | None) -> None:
+        """
+        Directly cancel every unfinished child handle when any child has
+        already failed. Cancelling the child's own handle scope penetrates
+        self-installed shields, unlike plain nursery cancellation.
+        """
+        should_cancel = exc_val is not None and not isinstance(exc_val, trio.Cancelled)
+        if not should_cancel:
+            for handle in tuple(self._handles):
+                if handle.status is TaskHandle.Status.FAILED:
+                    should_cancel = True
+                    break
+
+        if should_cancel:
+            for handle in tuple(self._handles):
+                if handle.status in (
+                    TaskHandle.Status.PENDING,
+                    TaskHandle.Status.CANCELLING,
+                ):
+                    handle.cancel()
+
+    def _take_external_exceptions(self) -> tuple[BaseException, ...]:
+        external = tuple(self._external_exceptions)
+        self._external_exceptions.clear()
+        return external
+
+    def _merge_external_exceptions(
+        self, exc: BaseExceptionGroup
+    ) -> BaseExceptionGroup:
+        external = self._take_external_exceptions()
+        if not external:
+            return exc
+
+        return BaseExceptionGroup(
+            exc.message, tuple(exc.exceptions) + external
+        )
 
     def create_task(
         self,
@@ -273,7 +500,18 @@ class TaskGroup(abc.TaskGroup):
         self._check_active(coro)
         final_name = get_coro_name(coro, name)
         handle = TaskHandle(coro, final_name)
-        if context is not None:
+        self._handles.add(handle)
+
+        frame = tgpolicy.get_current_task_group_policy()
+        if frame.spawn_scope_bind is SpawnScopeBind.KEEP_CALLER_UNTIL_STARTED:
+            # The start_soon path is intentionally separate from start():
+            # children stay outside the group nursery until an explicit
+            # started() on their spawn task status.
+            if context is not None:
+                context.run(self._spawn_deferred_child, handle)
+            else:
+                self._spawn_deferred_child(handle)
+        elif context is not None:
             context.run(
                 partial(self._nursery.start_soon, handle._run_coro, name=handle.name)
             )
@@ -282,6 +520,96 @@ class TaskGroup(abc.TaskGroup):
 
         return handle
 
+    def _spawn_deferred_child(self, handle: TaskHandle[Any]) -> None:
+        self._deferred_pending += 1
+        assert self._deferred_drained is not None
+        self._deferred_drained = trio.Event()
+        self._ensure_broker()
+        # Capture the caller's context; the child is spawned in it inside
+        # the holding nursery so it inherits the active policy frames.
+        request = _DeferredSpawnRequest(copy_context(), handle)
+        self._broker_tx.send_nowait(request)
+
+    def _ensure_broker(self) -> None:
+        """Lazily spawn the broker that owns deferred spawns in the holding."""
+        if self._broker_tx is not None:
+            return
+
+        assert self._holding is not None
+        tx, rx = trio.open_memory_channel(math.inf)
+        broker_handle = TaskHandle(
+            self._broker_main(rx), "anyio task group policy broker"
+        )
+        self._holding.start_soon(
+            broker_handle._run_coro, name="anyio task group policy broker"
+        )
+        self._broker_handle = broker_handle
+        self._broker_tx = tx
+
+    async def _broker_main(self, rx: Any) -> None:
+        # The broker lives in the holding nursery (an ancestor of the group
+        # nursery within the host task's scope chain): group cancellation
+        # cannot reach it, while cancellation of any enclosing scope does.
+        # Deferred children are spawned as its siblings in the same nursery.
+        assert self._holding is not None
+        holding = self._holding
+        async for request in rx:
+            # Entering the captured caller context for the synchronous
+            # start_soon call makes Trio copy that context for the child.
+            request.ctx.run(
+                partial(
+                    holding.start_soon,
+                    partial(self._deferred_outer, request),
+                    name=request.handle.name,
+                )
+            )
+
+    async def _deferred_outer(self, request: _DeferredSpawnRequest) -> None:
+        assert self._nursery is not None
+        status = _DeferredTaskStatus(self._nursery)
+
+        async def launcher(*, task_status: trio.TaskStatus[Any]) -> None:
+            status._real_task_status = task_status
+            with tgpolicy._install_spawn_status(status):
+                await request.handle._run_coro()
+
+        try:
+            # nursery.start() from this outer task spawns into a temporary
+            # nursery outside the group scope and moves the child into the
+            # group nursery only when started() is called.
+            await self._nursery.start(launcher, name=request.handle.name)
+        except trio.Cancelled:
+            if self._exiting:
+                # The group exit asked for the cancellation of unfinished
+                # peers directly (through the child's own handle scope). The
+                # child is not a group child yet, so its Cancelled must not
+                # tear down the holding nursery; it simply never joined.
+                return
+
+            # Cancellation of the enclosing task tree: propagate it so the
+            # holding nursery tears down with the rest of the tree.
+            raise
+        except BaseException as exc:
+            handle_status = request.handle.status
+            if handle_status is TaskHandle.Status.FINISHED:
+                # A start_soon child is never required to call started();
+                # Trio's "child exited without calling task_status.started()"
+                # is a normal completion on this path.
+                return
+
+            if handle_status is TaskHandle.Status.FAILED:
+                exc = cast(BaseException, request.handle._exception)
+
+            self._external_exceptions.append(exc)
+            self._nursery.cancel_scope.cancel()
+        finally:
+            self._deferred_finished_one()
+
+    def _deferred_finished_one(self) -> None:
+        self._deferred_pending -= 1
+        if self._deferred_pending == 0 and self._deferred_drained is not None:
+            self._deferred_drained.set()
+
     async def start(
         self,
         func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
@@ -289,13 +617,42 @@ class TaskGroup(abc.TaskGroup):
         name: object = None,
         return_handle: Literal[False, True] = False,
     ) -> Any:
+        self._check_active()
+        final_name = get_callable_name(func, name)
+        frame = tgpolicy.get_current_task_group_policy()
+        if frame.spawn_scope_bind is SpawnScopeBind.FORCE_GROUP_IMMEDIATE:
+            return await self._start_force_group(
+                func, args, final_name, return_handle
+            )
+
+        return await self._start_deferred_native(
+            func,
+            args,
+            final_name,
+            return_handle,
+            install_spawn_status=(
+                frame.spawn_scope_bind
+                is SpawnScopeBind.KEEP_CALLER_UNTIL_STARTED
+            ),
+        )
+
+    async def _start_deferred_native(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
+        args: tuple[Any, ...],
+        final_name: object,
+        return_handle: bool,
+        *,
+        install_spawn_status: bool,
+    ) -> Any:
+        assert self._nursery is not None
         handle: TaskHandle[T_co]
 
         async def run_coro_with_task_status(
             *, task_status: trio.TaskStatus[Any]
         ) -> None:
             nonlocal handle
-            wrapper_task_status = _TrioTaskStatus()
+            wrapper_task_status = _TrioTaskStatus(self._nursery)
             coro = call_for_coroutine(func, args, task_status=wrapper_task_status)
             if wrapper_task_status.early_start_value is not empty_start_value:
                 task_status.started(wrapper_task_status.early_start_value)
@@ -303,13 +660,82 @@ class TaskGroup(abc.TaskGroup):
                 wrapper_task_status.real_task_status = task_status
 
             handle = TaskHandle(coro, final_name)
-            await handle._run_coro()
+            self._handles.add(handle)
+            if install_spawn_status:
+                with tgpolicy._install_spawn_status(wrapper_task_status):
+                    await handle._run_coro()
+            else:
+                await handle._run_coro()
 
-        self._check_active()
-        final_name = get_callable_name(func, name)
         start_value = await self._nursery.start(
             run_coro_with_task_status, name=final_name
         )
+        if return_handle:
+            handle._start_value = start_value
+            return handle
+        else:
+            return start_value
+
+    async def _start_force_group(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
+        args: tuple[Any, ...],
+        final_name: object,
+        return_handle: bool,
+    ) -> Any:
+        assert self._nursery is not None
+        result_box: dict[str, Any] = {}
+        settled = trio.Event()
+        wrapper_status = _ForceGroupTaskStatus(self._nursery, settled, result_box)
+        handle: TaskHandle[T_co]
+
+        async def runner() -> None:
+            nonlocal handle
+            with tgpolicy._install_spawn_status(wrapper_status):
+                coro = call_for_coroutine(func, args, task_status=wrapper_status)
+                handle = TaskHandle(coro, final_name)
+                self._handles.add(handle)
+                try:
+                    await handle._run_coro()
+                except BaseException as exc:
+                    if not wrapper_status._started:
+                        # Before readiness the error belongs to the caller of
+                        # start(), not to the nursery: hand it over and finish the
+                        # (already group-scoped) task cleanly.
+                        result_box["result"] = Error(exc)
+                        settled.set()
+                        return
+
+                    raise
+
+                if not wrapper_status._started:
+                    result_box["result"] = Error(
+                        RuntimeError(
+                            "Child exited without calling task_status.started()"
+                        )
+                    )
+                    settled.set()
+
+        self._nursery.start_soon(runner, name=final_name)
+        try:
+            await settled.wait()
+        except BaseException:
+            if (
+                "handle" in locals()
+                and handle.status is TaskHandle.Status.PENDING
+            ):
+                # Cancel the task and wait for it to exit before returning.
+                handle.cancel()
+                with trio.CancelScope(shield=True):
+                    await handle.wait()
+
+            raise
+
+        result = result_box["result"]
+        if isinstance(result, Error):
+            raise result.error
+
+        start_value = cast(Value[Any], result).value
         if return_handle:
             handle._start_value = start_value
             return handle

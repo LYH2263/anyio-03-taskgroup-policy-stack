@@ -95,6 +95,23 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._synchronization import ResourceGuard as ResourceGuard
     from ._core._synchronization import Semaphore as Semaphore
     from ._core._synchronization import SemaphoreStatistics as SemaphoreStatistics
+    from ._core._taskgroup_policy import GroupExitSurface as GroupExitSurface
+    from ._core._taskgroup_policy import SpawnScopeBind as SpawnScopeBind
+    from ._core._taskgroup_policy import StartReparentGate as StartReparentGate
+    from ._core._taskgroup_policy import TaskGroupPolicyFrame as TaskGroupPolicyFrame
+    from ._core._taskgroup_policy import TaskGroupPolicyToken as TaskGroupPolicyToken
+    from ._core._taskgroup_policy import TaskGroupPolicyView as TaskGroupPolicyView
+    from ._core._taskgroup_policy import current_task_status as current_task_status
+    from ._core._taskgroup_policy import (
+        get_current_task_group_policy as get_current_task_group_policy,
+    )
+    from ._core._taskgroup_policy import (
+        pop_task_group_policy as pop_task_group_policy,
+    )
+    from ._core._taskgroup_policy import (
+        push_task_group_policy as push_task_group_policy,
+    )
+    from ._core._taskgroup_policy import task_group_policy as task_group_policy
     from ._core._tasks import TASK_STATUS_IGNORED as TASK_STATUS_IGNORED
     from ._core._tasks import CancelScope as CancelScope
     from ._core._tasks import TaskHandle as TaskHandle

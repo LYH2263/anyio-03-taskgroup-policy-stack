@@ -3,6 +3,17 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added a task-tree-level task group policy stack
+  (``anyio.push_task_group_policy()`` / ``anyio.pop_task_group_policy()`` and the
+  ``anyio.task_group_policy()`` context manager) that allows nested, resettable
+  customization of how spawned tasks are bound to the task group's cancel scope
+  (``anyio.SpawnScopeBind``), how ``task_status.started()`` reparents a task
+  (``anyio.StartReparentGate``), and how a task group surfaces failures on exit
+  (``anyio.GroupExitSurface``), on both asyncio and Trio, without adding
+  parameters to the existing task group APIs
+
 **4.15.1**
 
 - Implemented a compatibility fix for supporting direct access of ``anyio.*`` submodules
