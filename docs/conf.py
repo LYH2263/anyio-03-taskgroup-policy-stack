@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from importlib.metadata import version as get_version
+
+from packaging.version import parse
+
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.intersphinx",
+    "sphinx_tabs.tabs",
+    "sphinx_autodoc_typehints",
+    "sphinx_rtd_theme",
+]
+
+templates_path = ["_templates"]
+source_suffix = ".rst"
+master_doc = "index"
+project = "AnyIO"
+author = "Alex Grönholm"
+copyright = "2018, " + author
+
+v = parse(get_version("anyio"))
+version = v.base_version
+release = v.public
+
+language = "en"
+
+exclude_patterns = ["_build"]
+pygments_style = "sphinx"
+autodoc_default_options = {"members": True, "show-inheritance": True}
+autodoc_mock_imports = ["_typeshed", "pytest", "_pytest"]
+todo_include_todos = False
+suppress_warnings = ["config.cache"]
+
+
+def fixup_module_name(module: str) -> str:
+    if module.startswith("anyio.abc._"):
+        return "anyio.abc"
+    elif module.startswith("anyio._"):
+        return "anyio"
+    else:
+        return module
+
+
+typehints_fixup_module_name = fixup_module_name
+html_theme = "sphinx_rtd_theme"
+htmlhelp_basename = "anyiodoc"
+
+intersphinx_mapping = {"python": ("https://docs.python.org/3/", None)}
